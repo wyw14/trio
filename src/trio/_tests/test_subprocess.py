@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import gc
 import os
 import random
@@ -766,3 +767,210 @@ async def test_subprocess_pidfd_unnotified() -> None:
             # for everything to notice
             await noticed_exit.wait()
         assert noticed_exit.is_set(), "child task wasn't woken after poll, DEADLOCK"
+
+
+PRINT_ENV_VAR = python(
+    "import os, sys; sys.stdout.write(os.environ.get('TRIO_TEST_VAR', ''))",
+)
+PRINT_CWD = python("import os, sys; sys.stdout.write(os.getcwd())")
+PRINT_CWD_AND_VAR = python(
+    "import os, sys;"
+    " sys.stdout.write(os.getcwd() + chr(0) + os.environ['TRIO_INHERIT_VAR'])",
+)
+
+
+async def test_env_per_process_isolation() -> None:
+    # Several processes started (concurrently, in the same nursery) using
+    # different env mappings; each must see only its own.
+    values = ["alpha", "beta", "gamma"]
+    results: dict[str, bytes | None] = {}
+
+    async def child(value: str) -> None:
+        result = await run_process(
+            PRINT_ENV_VAR,
+            capture_stdout=True,
+            env={**os.environ, "TRIO_TEST_VAR": value},
+        )
+        results[value] = result.stdout
+
+    async with _core.open_nursery() as nursery:
+        for value in values:
+            nursery.start_soon(child, value)
+
+    assert results == {value: value.encode() for value in values}
+
+
+async def test_env_cwd_are_snapshotted(
+    tmp_path: SyncPath,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The env mapping is copied and cwd is resolved *at call time*, so later
+    # modifications by the caller (or sibling calls) can't reach the child.
+    real_popen = trio._subprocess.subprocess.Popen
+    seen: list[dict[str, Any]] = []
+
+    def recording_popen(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(trio._subprocess.subprocess, "Popen", recording_popen)
+
+    source = {**os.environ, "TRIO_SPY": "one"}
+    await run_process(EXIT_TRUE, env=source, cwd=tmp_path, check=False)
+
+    passed_env = seen[0]["env"]
+    passed_cwd = seen[0]["cwd"]
+    assert isinstance(passed_env, dict)
+    assert passed_env is not source
+    assert passed_env == source
+    assert os.path.isabs(os.fspath(passed_cwd))
+    assert os.path.normcase(os.fspath(passed_cwd)) == os.path.normcase(
+        os.fspath(tmp_path),
+    )
+    # The caller's mapping is left exactly as it was.
+    assert source["TRIO_SPY"] == "one"
+
+
+async def test_open_process_env_cwd(tmp_path: SyncPath) -> None:
+    proc = await open_process(
+        python(
+            "import os, sys;"
+            " sys.stdout.write(os.environ['TRIO_TEST_VAR'] + os.getcwd())",
+        ),
+        stdout=subprocess.PIPE,
+        env={**os.environ, "TRIO_TEST_VAR": "hello"},
+        cwd=tmp_path,
+    )
+    try:
+        assert proc.stdout is not None
+        chunks: list[bytes] = []
+        async for chunk in proc.stdout:
+            chunks.append(chunk)
+        output = b"".join(chunks)
+        assert output.startswith(b"hello")
+        assert os.path.normcase(os.fsdecode(output[len(b"hello") :])) == os.path.normcase(
+            os.fspath(tmp_path),
+        )
+    finally:
+        proc.kill()
+        await proc.wait()
+
+
+async def test_cwd_per_process(tmp_path: SyncPath) -> None:
+    # Different working directories, including concurrent processes started
+    # from the same nursery.
+    d1 = tmp_path / "d1"
+    d2 = tmp_path / "d2"
+    d1.mkdir()
+    d2.mkdir()
+    results: dict[str, str] = {}
+
+    async def child(name: str, directory: SyncPath) -> None:
+        result = await run_process(PRINT_CWD, capture_stdout=True, cwd=directory)
+        assert result.stdout is not None
+        results[name] = os.path.normcase(os.fsdecode(result.stdout))
+
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(child, "one", d1)
+        nursery.start_soon(child, "two", d2)
+
+    assert results == {
+        "one": os.path.normcase(os.fspath(d1)),
+        "two": os.path.normcase(os.fspath(d2)),
+    }
+
+
+async def test_cwd_relative_resolved_at_call(
+    tmp_path: SyncPath,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A relative directory is resolved against the parent's working directory
+    # at call time -- later changes to the parent's directory don't matter.
+    monkeypatch.chdir(tmp_path)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    result = await run_process(PRINT_CWD, capture_stdout=True, cwd="sub")
+    assert result.stdout is not None
+    assert os.path.normcase(os.fsdecode(result.stdout)) == os.path.normcase(
+        os.fspath(sub),
+    )
+
+
+async def test_cwd_missing(tmp_path: SyncPath) -> None:
+    missing = tmp_path / "no_such_dir"
+    with pytest.raises(FileNotFoundError) as excinfo:
+        await run_process(EXIT_TRUE, cwd=missing, check=False)
+    assert excinfo.value.errno == errno.ENOENT
+    assert os.path.normcase(os.fspath(excinfo.value.filename)) == os.path.normcase(
+        os.fspath(missing),
+    )
+
+
+async def test_cwd_not_a_directory(tmp_path: SyncPath) -> None:
+    afile = tmp_path / "afile"
+    afile.write_text("x")
+    with pytest.raises(NotADirectoryError) as excinfo:
+        await run_process(EXIT_TRUE, cwd=afile, check=False)
+    assert excinfo.value.errno == errno.ENOTDIR
+
+
+@pytest.mark.skipif(os.name != "posix", reason="chmod-based test is POSIX-only")
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root bypasses directory permissions",
+)
+async def test_cwd_permission_denied(tmp_path: SyncPath) -> None:
+    restricted = tmp_path / "noentry"
+    restricted.mkdir()
+    os.chmod(restricted, 0o000)
+    try:
+        with pytest.raises(PermissionError) as excinfo:
+            await run_process(EXIT_TRUE, cwd=restricted, check=False)
+        assert excinfo.value.errno == errno.EACCES
+    finally:
+        # Restore permissions so tmp_path can be cleaned up.
+        os.chmod(restricted, 0o700)
+
+
+async def test_spawn_failure_reported_separately() -> None:
+    # A process that can't be started at all is reported distinctly from any
+    # directory problem.
+    with pytest.raises(FileNotFoundError) as excinfo:
+        await run_process(["no_such_binary_xyz_123"], check=False)
+    assert excinfo.value.errno == errno.ENOENT
+
+
+async def test_cwd_error_reported_before_spawn_error(tmp_path: SyncPath) -> None:
+    # With both a bad cwd and a bad executable, the directory problem is the
+    # one reported (it's checked before spawning).
+    missing_cwd = tmp_path / "no_such_dir"
+    with pytest.raises(FileNotFoundError) as excinfo:
+        await run_process(["no_such_binary_xyz_123"], cwd=missing_cwd, check=False)
+    assert excinfo.value.errno == errno.ENOENT
+    assert os.path.normcase(os.fspath(excinfo.value.filename)) == os.path.normcase(
+        os.fspath(missing_cwd),
+    )
+
+
+async def test_resources_cleaned_after_exit() -> None:
+    proc = await open_process(EXIT_TRUE)
+    await proc.wait()
+    assert proc.returncode == 0
+    # Trio-side resource for this process (e.g. the Linux pidfd) is released
+    # once the exit is observed.
+    assert proc._pidfd is None
+
+
+async def test_default_inheritance(
+    tmp_path: SyncPath,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With neither env nor cwd given, the child keeps inheriting both -- just
+    # like a plain subprocess launch.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TRIO_INHERIT_VAR", "inherited")
+    result = await run_process(PRINT_CWD_AND_VAR, capture_stdout=True)
+    assert result.stdout is not None
+    child_cwd, child_var = result.stdout.split(b"\x00")
+    assert os.path.normcase(os.fsdecode(child_cwd)) == os.path.normcase(os.getcwd())
+    assert child_var == b"inherited"

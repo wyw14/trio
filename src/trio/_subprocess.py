@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import subprocess
 import sys
@@ -252,8 +253,12 @@ class Process(metaclass=NoPublicConstructor):
                 # kqueue reports that the process has exited, but
                 # waitpid(WNOHANG) can't yet reap it. So this .wait() may
                 # actually block for a tiny fraction of a second.
-                self._proc.wait()
-                self._close_pidfd()
+                try:
+                    self._proc.wait()
+                finally:
+                    # The child is (or should be) gone -- release our
+                    # resources even if the reap call raised.
+                    self._close_pidfd()
         assert self._proc.returncode is not None
         return self._proc.returncode
 
@@ -303,12 +308,51 @@ class Process(metaclass=NoPublicConstructor):
         self._proc.kill()
 
 
+def _validate_cwd(cwd: StrOrBytesPath) -> StrOrBytesPath:
+    # Resolve the directory once, at call time and relative to *our* current
+    # directory -- later changes to the parent's working directory can't affect
+    # where the child starts.
+    cwd = os.path.abspath(os.fspath(cwd))
+    # Report directory problems distinctly, before (and separately from)
+    # any failure to start the actual process.
+    try:
+        os.stat(cwd)
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            errno.ENOENT,
+            os.strerror(errno.ENOENT),
+            cwd,
+        ) from None
+    except PermissionError:
+        raise PermissionError(
+            errno.EACCES,
+            os.strerror(errno.EACCES),
+            cwd,
+        ) from None
+    if not os.path.isdir(cwd):
+        raise NotADirectoryError(
+            errno.ENOTDIR,
+            os.strerror(errno.ENOTDIR),
+            cwd,
+        )
+    if os.name == "posix" and not os.access(cwd, os.X_OK):
+        # chdir() into the directory would fail with EACCES.
+        raise PermissionError(
+            errno.EACCES,
+            os.strerror(errno.EACCES),
+            cwd,
+        )
+    return cwd
+
+
 async def _open_process(
     command: StrOrBytesPath | Sequence[StrOrBytesPath],
     *,
     stdin: int | HasFileno | None = None,
     stdout: int | HasFileno | None = None,
     stderr: int | HasFileno | None = None,
+    env: Mapping[str, str] | None = None,
+    cwd: StrOrBytesPath | None = None,
     **options: object,
 ) -> Process:
     r"""Execute a child program in a new process.
@@ -351,6 +395,16 @@ async def _open_process(
           which causes the child's standard output and standard error
           messages to be intermixed on a single standard output stream,
           attached to whatever the ``stdout`` option says to attach it to.
+      env: A mapping of environment variable names to values for this
+          process only. The mapping is copied when the process starts, so
+          later changes to it (including by other processes) cannot affect
+          this child. If ``None`` (the default), the child inherits the
+          parent's environment.
+      cwd: The working directory for this process only. It is resolved and
+          checked before the process starts, so later changes to it or to
+          the parent's working directory cannot affect this child. If
+          ``None`` (the default), the child inherits the parent's working
+          directory.
       **options: Other :ref:`general subprocess options <subprocess-options>`
           are also accepted.
 
@@ -358,8 +412,11 @@ async def _open_process(
       A new `trio.Process` object.
 
     Raises:
-      OSError: if the process spawning fails, for example because the
-         specified command could not be found.
+      FileNotFoundError: if ``cwd`` does not exist, or if the process
+         spawning fails because the specified command could not be found.
+      NotADirectoryError: if ``cwd`` exists but is not a directory.
+      PermissionError: if ``cwd`` cannot be entered, or if the process
+         spawning fails due to insufficient permissions.
 
     """
     for key in ("universal_newlines", "text", "encoding", "errors", "bufsize"):
@@ -381,6 +438,17 @@ async def _open_process(
                 "command must be a string or bytes (not a sequence) if "
                 "shell=True on UNIX systems",
             )
+
+    # Snapshot the per-process settings *before* spawning. The environment
+    # is copied and the working directory validated/resolved here, so each
+    # child is isolated from later changes -- whether by this caller or by
+    # another open_process() call (e.g. a sibling process in the same
+    # nursery). When both are None we pass them through untouched, leaving
+    # the normal inheritance rules to subprocess.Popen.
+    if env is not None:
+        env = dict(env)
+    if cwd is not None:
+        cwd = _validate_cwd(cwd)
 
     trio_stdin: ClosableSendStream | None = None
     trio_stdout: ClosableReceiveStream | None = None
@@ -421,6 +489,8 @@ async def _open_process(
                 stdin=stdin,
                 stdout=stdout,
                 stderr=stderr,
+                env=env,
+                cwd=cwd,
                 **options,
             ),
         )
@@ -471,6 +541,8 @@ async def _run_process(
     capture_stderr: bool = False,
     check: bool = True,
     deliver_cancel: Callable[[Process], Awaitable[object]] | None = None,
+    env: Mapping[str, str] | None = None,
+    cwd: StrOrBytesPath | None = None,
     task_status: TaskStatus[Process] = trio.TASK_STATUS_IGNORED,
     **options: object,
 ) -> subprocess.CompletedProcess[bytes]:
@@ -736,7 +808,12 @@ async def _run_process(
 
     # Opening the process does not need to be inside the nursery, so we put it outside
     # so any exceptions get directly seen by users.
-    proc = await _open_process(command, **options)  # type: ignore[arg-type]
+    proc = await _open_process(  # type: ignore[arg-type]
+        command,
+        env=env,
+        cwd=cwd,
+        **options,
+    )
     async with trio.open_nursery() as nursery:
         try:
             if input_ is not None:

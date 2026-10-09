@@ -1,0 +1,7 @@
+`trio.run_process` and `trio.lowlevel.open_process` now snapshot the
+``env`` mapping (copied at call time) and resolve and check ``cwd`` before
+spawning, so each child process is isolated from later modifications by the
+caller or by sibling processes. Missing working directories, inaccessible
+working directories, and process-start failures are now reported as distinct
+errors; calls that don't specify ``env`` or ``cwd`` keep the usual
+inheritance behavior.
