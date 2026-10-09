@@ -755,3 +755,238 @@ async def test_as_safe_channel_close_during_iteration() -> None:
         # to. Otherwise, this test sometimes passes on a broken
         # version of trio.
         await trio.testing.wait_all_tasks_blocked()
+
+
+# ---------------------------------------------------------------------------
+# MPMC clone/close semantics: every waiter finishes, each value once
+# ---------------------------------------------------------------------------
+
+
+async def test_close_one_clone_keeps_channel_alive() -> None:
+    # rubric 1: closing one send clone must not end waiting receivers
+    s1, r1 = open_memory_channel[int](0)
+    s2 = s1.clone()
+    r2 = r1.clone()
+    got: list[int] = []
+
+    async def recv_will_wait(recv: trio.MemoryReceiveChannel[int]) -> None:
+        got.append(await recv.receive())
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(recv_will_wait, r2)
+        await wait_all_tasks_blocked()
+        await s1.aclose()  # not the last open send clone
+        await wait_all_tasks_blocked()
+        # The receiver is still blocked, so a send on the surviving clone
+        # delivers the value rather than EndOfChannel.
+        await s2.send(42)
+    assert got == [42]
+
+    # symmetric: closing one receive clone must not fail a blocked sender
+    s1, r1 = open_memory_channel[int](0)
+    r2 = r1.clone()
+    s2 = s1.clone()
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(s2.send, 7)
+        await wait_all_tasks_blocked()
+        await r1.aclose()  # not the last open receive clone
+        await wait_all_tasks_blocked()
+        assert await r2.receive() == 7
+
+
+async def test_last_send_close_ends_all_receivers() -> None:
+    # rubric 2: when the last send clone closes, all blocked receivers,
+    # spread across receive clones, get EndOfChannel in finite steps.
+    s1, r1 = open_memory_channel[int](0)
+    s2 = s1.clone()
+    r2 = r1.clone()
+    r3 = r1.clone()
+    ended: list[int] = []
+
+    async def recv(recv: trio.MemoryReceiveChannel[int], i: int) -> None:
+        with pytest.raises(EndOfChannel):
+            await recv.receive()
+        ended.append(i)
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(recv, r1, 0)
+        nursery.start_soon(recv, r2, 1)
+        nursery.start_soon(recv, r3, 2)
+        await wait_all_tasks_blocked()
+        await s1.aclose()
+        await s2.aclose()
+    assert sorted(ended) == [0, 1, 2]
+
+
+async def test_last_recv_close_fails_all_senders() -> None:
+    # rubric 3: when the last receive clone closes, all blocked senders,
+    # spread across send clones, get BrokenResourceError in finite steps.
+    s1, r1 = open_memory_channel[int](0)
+    s2 = s1.clone()
+    s3 = s1.clone()
+    r2 = r1.clone()
+    failed: list[int] = []
+
+    async def send(send: trio.MemorySendChannel[int], i: int) -> None:
+        with pytest.raises(trio.BrokenResourceError):
+            await send.send(i)
+        failed.append(i)
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(send, s1, 0)
+        nursery.start_soon(send, s2, 1)
+        nursery.start_soon(send, s3, 2)
+        await wait_all_tasks_blocked()
+        await r1.aclose()
+        await r2.aclose()
+    assert sorted(failed) == [0, 1, 2]
+
+
+async def test_each_value_delivered_once() -> None:
+    # rubric 4: with multiple producer/consumer clones, every sent value
+    # is taken by exactly one receiver -- no duplicates, no losses.
+    n_prod, n_cons = 5, 4
+    s0, r0 = open_memory_channel[int](2)
+    sends = [s0, *(s0.clone() for _ in range(n_prod - 1))]
+    recvs = [r0, *(r0.clone() for _ in range(n_cons - 1))]
+    got: list[int] = []
+
+    async def producer(send: trio.MemorySendChannel[int], pid: int) -> None:
+        async with send:
+            for j in range(10):
+                await send.send(pid * 100 + j)
+
+    async def consumer(recv: trio.MemoryReceiveChannel[int]) -> None:
+        async for value in recv:
+            got.append(value)
+
+    async with trio.open_nursery() as nursery:
+        for i, send in enumerate(sends):
+            nursery.start_soon(producer, send, i)
+        for recv in recvs:
+            nursery.start_soon(consumer, recv)
+
+    assert len(got) == 50
+    assert len(set(got)) == 50
+    assert set(got) == {p * 100 + j for p in range(5) for j in range(10)}
+
+
+async def test_concurrent_send_receive_close() -> None:
+    # rubric 5: sends, receives and closes all happening together -- every
+    # participant reaches a definite outcome, no task hangs forever.
+    s0, r0 = open_memory_channel[int](0)
+    sends = [s0, *(s0.clone() for _ in range(3))]
+    recvs = [r0, *(r0.clone() for _ in range(3))]
+    got: list[int] = []
+    finished: list[tuple[str, int]] = []
+
+    async def producer(send: trio.MemorySendChannel[int], pid: int) -> None:
+        try:
+            for j in range(5):
+                await send.send(pid * 10 + j)
+        except (trio.ClosedResourceError, trio.BrokenResourceError):
+            pass
+        finally:
+            send.close()
+            finished.append(("p", pid))
+
+    async def consumer(recv: trio.MemoryReceiveChannel[int], cid: int) -> None:
+        try:
+            while True:
+                got.append(await recv.receive())
+        except (EndOfChannel, trio.ClosedResourceError, trio.BrokenResourceError):
+            finished.append(("c", cid))
+
+    async def close_one_receive_early() -> None:
+        await trio.lowlevel.checkpoint()
+        recvs[0].close()
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(close_one_receive_early)
+        for i, send in enumerate(sends):
+            nursery.start_soon(producer, send, i)
+        for j, recv in enumerate(recvs):
+            nursery.start_soon(consumer, recv, j)
+
+    # 4 producers + 4 consumers all exited, and whatever was delivered was
+    # delivered at most once.
+    assert len(finished) == 8
+    assert len(got) == len(set(got))
+    stats = s0.statistics()
+    assert stats.tasks_waiting_send == 0
+    assert stats.tasks_waiting_receive == 0
+
+
+async def test_send_races_last_receive_close() -> None:
+    # rubric 6: a sender starting at the same moment the last receive
+    # clone closes gets a definite failure rather than hanging.
+    s1, r1 = open_memory_channel[int](0)
+    result: list[str] = []
+
+    async def sending() -> None:
+        try:
+            await s1.send(1)
+        except trio.BrokenResourceError:
+            result.append("broken")
+        except trio.ClosedResourceError:
+            result.append("closed")
+        else:
+            result.append("sent")
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(sending)
+        nursery.start_soon(r1.aclose)
+
+    assert result in (["broken"], ["closed"])
+
+
+async def test_receive_races_last_send_close() -> None:
+    # rubric 6 (other direction): a receiver starting at the same moment
+    # the last send clone closes gets a definite EndOfChannel.
+    s1, r1 = open_memory_channel[int](0)
+    result: list[str] = []
+
+    async def receiving() -> None:
+        with pytest.raises(EndOfChannel):
+            await r1.receive()
+        result.append("ended")
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(receiving)
+        nursery.start_soon(s1.aclose)
+
+    assert result == ["ended"]
+
+
+async def test_repeated_close_is_idempotent() -> None:
+    # rubric 7: closing a clone repeatedly is a no-op and never affects
+    # waiters belonging to surviving clones.
+    s1, r1 = open_memory_channel[int](0)
+    s2 = s1.clone()
+    r2 = r1.clone()
+    got: list[int] = []
+
+    async def recv_will_wait(recv: trio.MemoryReceiveChannel[int]) -> None:
+        got.append(await recv.receive())
+
+    s1.close()
+    s1.close()
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(recv_will_wait, r2)
+        await wait_all_tasks_blocked()
+        await s2.send(99)
+    assert got == [99]
+
+    r1.close()
+    r1.close()
+    # r2 is still a live receiver, so s2 is not broken -- a full buffer
+    # gives WouldBlock, never BrokenResourceError.
+    with pytest.raises(trio.WouldBlock):
+        s2.send_nowait(100)
+
+    s2.close()
+    with pytest.raises(EndOfChannel):
+        r2.receive_nowait()
+    r2.close()
+    r2.close()

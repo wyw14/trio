@@ -243,6 +243,12 @@ class MemorySendChannel(SendChannel[SendType], metaclass=NoPublicConstructor):
             await trio.lowlevel.cancel_shielded_checkpoint()
             return
 
+        # No checkpoint exists between the failed send_nowait above and
+        # this registration, so this runs as one atomic step: a close()
+        # either happened before send_nowait (which would have raised) or
+        # happens after we're registered (and close() will find and wake
+        # us). A waiter can never be registered into an already-drained
+        # channel and then left hanging.
         task = trio.lowlevel.current_task()
         self._tasks.add(task)
         self._state.send_tasks[task] = value
@@ -312,17 +318,36 @@ class MemorySendChannel(SendChannel[SendType], metaclass=NoPublicConstructor):
         if self._closed:
             return
         self._closed = True
-        for task in self._tasks:
-            trio.lowlevel.reschedule(task, Error(trio.ClosedResourceError()))
-            del self._state.send_tasks[task]
+        state = self._state
+
+        # Snapshot the senders blocked on *this* clone and detach them
+        # from both the per-clone set and the channel-wide table before
+        # anyone is rescheduled.
+        closed_senders = [
+            (task, Error(trio.ClosedResourceError())) for task in self._tasks
+        ]
         self._tasks.clear()
-        self._state.open_send_channels -= 1
-        if self._state.open_send_channels == 0:
-            assert not self._state.send_tasks
-            for task in self._state.receive_tasks:
-                task.custom_sleep_data._tasks.remove(task)
-                trio.lowlevel.reschedule(task, Error(trio.EndOfChannel()))
-            self._state.receive_tasks.clear()
+        for task, _ in closed_senders:
+            del state.send_tasks[task]
+
+        state.open_send_channels -= 1
+
+        # If this was the last open send clone, then every blocked
+        # receiver is detached too -- they will all get EndOfChannel.
+        ended_receivers: list[Task] = []
+        if state.open_send_channels == 0:
+            assert not state.send_tasks
+            ended_receivers = list(state.receive_tasks)
+            state.receive_tasks.clear()
+
+        # Counts and wait tables are now final; wake everyone in one sweep.
+        for task, failed in closed_senders:
+            trio.lowlevel.reschedule(task, failed)
+        for task in ended_receivers:
+            # Grab the owning clone before rescheduling, which clears
+            # task.custom_sleep_data.
+            task.custom_sleep_data._tasks.remove(task)
+            trio.lowlevel.reschedule(task, Error(trio.EndOfChannel()))
 
     @enable_ki_protection
     async def aclose(self) -> None:
@@ -367,15 +392,29 @@ class MemoryReceiveChannel(ReceiveChannel[ReceiveType], metaclass=NoPublicConstr
         """
         if self._closed:
             raise trio.ClosedResourceError
-        if self._state.send_tasks:
-            task, value = self._state.send_tasks.popitem(last=False)
+        state = self._state
+        if state.data:
+            # Consume the oldest buffered value first. Only once this
+            # call is committed to returning a value do we hand the freed
+            # buffer slot to the oldest blocked sender: its value is
+            # moved into the buffer *before* it is woken, so a woken
+            # sender always has its value safely owned by the channel.
+            value = state.data.popleft()
+            if state.send_tasks:
+                task, sender_value = state.send_tasks.popitem(last=False)
+                task.custom_sleep_data._tasks.remove(task)
+                state.data.append(sender_value)
+                trio.lowlevel.reschedule(task)
+            return value
+        if state.send_tasks:
+            # Nothing buffered: rendezvous directly with the oldest
+            # blocked sender. Its value is what we return, and the sender
+            # is only woken once we've taken ownership of that value.
+            task, value = state.send_tasks.popitem(last=False)
             task.custom_sleep_data._tasks.remove(task)
             trio.lowlevel.reschedule(task)
-            self._state.data.append(value)
-            # Fall through
-        if self._state.data:
-            return self._state.data.popleft()
-        if not self._state.open_send_channels:
+            return value
+        if not state.open_send_channels:
             raise trio.EndOfChannel
         raise trio.WouldBlock
 
@@ -397,6 +436,12 @@ class MemoryReceiveChannel(ReceiveChannel[ReceiveType], metaclass=NoPublicConstr
             await trio.lowlevel.cancel_shielded_checkpoint()
             return value
 
+        # No checkpoint exists between the failed receive_nowait above
+        # and this registration, so this runs as one atomic step: a
+        # close() either happened before receive_nowait (which would have
+        # raised) or happens after we're registered (and close() will
+        # find and wake us). A waiter can never be registered into an
+        # already-drained channel and then left hanging.
         task = trio.lowlevel.current_task()
         self._tasks.add(task)
         self._state.receive_tasks[task] = None
@@ -470,18 +515,38 @@ class MemoryReceiveChannel(ReceiveChannel[ReceiveType], metaclass=NoPublicConstr
         if self._closed:
             return
         self._closed = True
-        for task in self._tasks:
-            trio.lowlevel.reschedule(task, Error(trio.ClosedResourceError()))
-            del self._state.receive_tasks[task]
+        state = self._state
+
+        # Snapshot the receivers blocked on *this* clone and detach them
+        # from both the per-clone set and the channel-wide table before
+        # anyone is rescheduled.
+        closed_receivers = [
+            (task, Error(trio.ClosedResourceError())) for task in self._tasks
+        ]
         self._tasks.clear()
-        self._state.open_receive_channels -= 1
-        if self._state.open_receive_channels == 0:
-            assert not self._state.receive_tasks
-            for task in self._state.send_tasks:
-                task.custom_sleep_data._tasks.remove(task)
-                trio.lowlevel.reschedule(task, Error(trio.BrokenResourceError()))
-            self._state.send_tasks.clear()
-            self._state.data.clear()
+        for task, _ in closed_receivers:
+            del state.receive_tasks[task]
+
+        state.open_receive_channels -= 1
+
+        # If this was the last open receive clone, then every blocked
+        # sender is detached too -- they will all fail to send, and any
+        # buffered values are discarded.
+        broken_senders: list[Task] = []
+        if state.open_receive_channels == 0:
+            assert not state.receive_tasks
+            broken_senders = list(state.send_tasks)
+            state.send_tasks.clear()
+            state.data.clear()
+
+        # Counts and wait tables are now final; wake everyone in one sweep.
+        for task, failed in closed_receivers:
+            trio.lowlevel.reschedule(task, failed)
+        for task in broken_senders:
+            # Grab the owning clone before rescheduling, which clears
+            # task.custom_sleep_data.
+            task.custom_sleep_data._tasks.remove(task)
+            trio.lowlevel.reschedule(task, Error(trio.BrokenResourceError()))
 
     @enable_ki_protection
     async def aclose(self) -> None:
