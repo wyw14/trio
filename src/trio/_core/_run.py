@@ -1739,17 +1739,65 @@ class GuestState:  # type: ignore[explicit-any]
     done_callback: Callable[[Outcome[Any]], object]  # type: ignore[explicit-any]
     unrolled_run_gen: Generator[float, EventResult, None]
     unrolled_run_next_send: Outcome[Any] = attrs.Factory(lambda: Value(None))  # type: ignore[explicit-any]
+    # Set exactly once, when the guest run has converged on a final outcome
+    # (normal completion, fatal guest error, or refusal by the host's
+    # callback scheduler). Afterwards any tick/event delivery that still
+    # reaches us is a *late* callback: it is rejected explicitly with
+    # RunFinishedError instead of being silently dropped, re-entering the
+    # exhausted generator, or invoking done_callback a second time.
+    guest_finished: bool = False
+
+    def _converge(self, run_outcome: Outcome[Any]) -> None:
+        # The single convergence point for a finished guest run: this is the
+        # only place done_callback is invoked. Always runs on the host thread.
+        if self.guest_finished:
+            raise RunFinishedError("guest run has already finished")
+        self.guest_finished = True
+        self.runner.guest_tick_scheduled = False
+        self.done_callback(run_outcome)
+
+    def _teardown_from_host_thread(self, exc: BaseException) -> TrioInternalError:
+        # The host refused to schedule the next tick while we were running on
+        # its thread. Drive the run loop through its normal teardown from here
+        # (runner.close() releases every wakeup handle), and convert the
+        # host's refusal into a single TrioInternalError. Throwing into the
+        # generator -- rather than dropping it -- also avoids the spurious
+        # "guest run got abandoned" warning, because we are reporting the
+        # failure explicitly.
+        internal_exc = TrioInternalError(
+            "trio guest run was terminated because the host's callback "
+            "scheduler refused to schedule the next guest tick",
+        )
+        internal_exc.__cause__ = exc
+        self.guest_finished = True
+        self.runner.guest_tick_scheduled = False
+        try:
+            self.unrolled_run_gen.throw(internal_exc)
+        except BaseException:
+            # Expected: unrolled_run runs its teardown (runner.close()) and
+            # re-raises the TrioInternalError we threw in. Whatever comes
+            # out, the generator has converged and must not be driven again.
+            pass
+        return internal_exc
 
     def guest_tick(self) -> None:
+        # A stale tick queued by the host after the run already converged.
+        # Reject it loudly -- silently accepting it would either re-enter the
+        # finished generator (and call done_callback again) or lose it.
+        if self.guest_finished:
+            raise RunFinishedError(
+                "a guest tick ran after the guest run had already finished",
+            )
+
         prev_library, sniffio_library.name = sniffio_library.name, "trio"
         try:
             timeout = self.unrolled_run_next_send.send(self.unrolled_run_gen)
         except StopIteration:
             assert self.runner.main_task_outcome is not None
-            self.done_callback(self.runner.main_task_outcome)
+            self._converge(self.runner.main_task_outcome)
             return
         except TrioInternalError as exc:
-            self.done_callback(Error(exc))
+            self._converge(Error(exc))
             return
         finally:
             sniffio_library.name = prev_library
@@ -1762,8 +1810,7 @@ class GuestState:  # type: ignore[explicit-any]
         if timeout <= 0 or isinstance(events_outcome, Error) or events_outcome.value:
             # No need to go into the thread
             self.unrolled_run_next_send = events_outcome
-            self.runner.guest_tick_scheduled = True
-            self.run_sync_soon_not_threadsafe(self.guest_tick)
+            self._schedule_next_tick_on_host()
         else:
             # Need to go into the thread and call get_events() there
             self.runner.guest_tick_scheduled = False
@@ -1772,14 +1819,84 @@ class GuestState:  # type: ignore[explicit-any]
                 return self.runner.io_manager.get_events(timeout)
 
             def deliver(events_outcome: Outcome[EventResult]) -> None:
-                def in_main_thread() -> None:
-                    self.unrolled_run_next_send = events_outcome
-                    self.runner.guest_tick_scheduled = True
-                    self.guest_tick()
-
-                self.run_sync_soon_threadsafe(in_main_thread)
+                self._deliver_events_from_worker(events_outcome)
 
             start_thread_soon(get_events, deliver)
+
+    def _schedule_next_tick_on_host(self) -> None:
+        # The host-resume convergence point: ask the host to run the next
+        # tick on its own thread, in queue order. If that scheduling call
+        # raises (e.g. the host loop is stopping), then the callback chain
+        # cannot continue; converge explicitly instead of leaving
+        # guest_tick_scheduled stuck at True with nothing in flight.
+        self.runner.guest_tick_scheduled = True
+        try:
+            self.run_sync_soon_not_threadsafe(self.guest_tick)
+        except BaseException as exc:
+            self.runner.guest_tick_scheduled = False
+            internal_exc = self._teardown_from_host_thread(exc)
+            self.done_callback(Error(internal_exc))
+
+    def _deliver_events_from_worker(
+        self,
+        events_outcome: Outcome[EventResult],
+    ) -> None:
+        # Called on a worker thread once get_events() returns. The worker
+        # never touches the run loop itself -- it only marshals back onto the
+        # host thread, so in_main_thread (and thus guest_tick) runs exactly
+        # once, on the host thread, in the order the host scheduled it.
+
+        def in_main_thread() -> None:
+            # The host may in principle deliver a queued callback more than
+            # once, or after the run already finished via another path; make
+            # that explicit instead of silently resurrecting the run.
+            if self.guest_finished:
+                raise RunFinishedError(
+                    "guest I/O events were delivered after the guest run "
+                    "had already finished",
+                )
+            self.unrolled_run_next_send = events_outcome
+            self.runner.guest_tick_scheduled = True
+            self.guest_tick()
+
+        try:
+            self.run_sync_soon_threadsafe(in_main_thread)
+        except BaseException as exc:
+            self._host_refused_threadsafe_callback(exc)
+
+    def _host_refused_threadsafe_callback(self, exc: BaseException) -> None:
+        # Running on a worker thread, the host's run_sync_soon_threadsafe
+        # refused to take the hand-off, so there is no host thread left to
+        # drive normal teardown. Mark the run terminated, close the run loop
+        # here (the same cleanup garbage collection would run, just promptly
+        # and without a duplicate "abandoned" warning), and hand the host an
+        # explicit error instead of letting the worker print a traceback and
+        # drop the outcome on the floor.
+        if self.guest_finished or self.runner.guest_terminated:
+            return
+        internal_exc = TrioInternalError(
+            "trio guest run was terminated because the host's threadsafe "
+            "callback scheduler refused to hand control back to the guest "
+            "thread",
+        )
+        internal_exc.__cause__ = exc
+        self.guest_finished = True
+        self.runner.guest_terminated = True
+        self.runner.guest_tick_scheduled = False
+        with suppress(BaseException):
+            self.unrolled_run_gen.close()
+        self.done_callback(Error(internal_exc))
+
+    def abort_before_first_tick(self, exc: BaseException) -> None:
+        # The host refused the very first tick, so the run can never start.
+        # Run the same teardown GC would (without an abandonment warning) so
+        # no wakeup handles or signal handlers are left behind; the caller of
+        # start_guest_run() receives the host's original exception.
+        self.guest_finished = True
+        self.runner.guest_terminated = True
+        self.runner.guest_tick_scheduled = False
+        with suppress(BaseException):
+            self.unrolled_run_gen.close()
 
 
 @attrs.define(eq=False)
@@ -1814,8 +1931,18 @@ class Runner:  # type: ignore[explicit-any]
     # Guest mode stuff
     is_guest: bool = False
     guest_tick_scheduled: bool = False
+    # Set once a guest run reaches teardown -- whether it finished normally,
+    # died from an internal error, or had to give up because the host's
+    # callback scheduler refused to keep driving it. Afterwards, host code
+    # that tries to wake the run gets an explicit RunFinishedError instead
+    # of poking at I/O wakeup handles that have already been closed.
+    guest_terminated: bool = False
 
     def force_guest_tick_asap(self) -> None:
+        if self.guest_terminated:
+            raise RunFinishedError(
+                "cannot wake a guest run that has already exited",
+            )
         if self.guest_tick_scheduled:
             return
         self.guest_tick_scheduled = True
@@ -2697,7 +2824,14 @@ def start_guest_run(  # type: ignore[explicit-any]
         )
 
     guest_state.unrolled_run_next_send = Value(next_send)
-    run_sync_soon_not_threadsafe(guest_state.guest_tick)
+    try:
+        run_sync_soon_not_threadsafe(guest_state.guest_tick)
+    except BaseException as exc:
+        # The host refused the very first guest tick. The run can never
+        # start, so tear the primed runner down (releasing wakeup handles /
+        # signal handlers) and let the host's own exception propagate.
+        guest_state.abort_before_first_tick(exc)
+        raise
 
 
 # 24 hours is arbitrary, but it avoids issues like people setting timeouts of
@@ -2931,19 +3065,28 @@ def unrolled_run(
                 del task, next_send, next_send_fn
 
     except GeneratorExit:
-        # The run-loop generator has been garbage collected without finishing
-        warnings.warn(
-            RuntimeWarning(
-                "Trio guest run got abandoned without properly finishing... "
-                "weird stuff might happen",
-            ),
-            stacklevel=1,
-        )
+        # The run-loop generator has been garbage collected without finishing.
+        # guest_terminated is already set when we tore the run down ourselves
+        # after the host's callback scheduler refused (in which case the
+        # failure was delivered to done_callback explicitly), so only warn for
+        # a genuinely abandoned run.
+        if not runner.guest_terminated:
+            warnings.warn(
+                RuntimeWarning(
+                    "Trio guest run got abandoned without properly finishing... "
+                    "weird stuff might happen",
+                ),
+                stacklevel=1,
+            )
     except TrioInternalError:
         raise
     except BaseException as exc:
         raise TrioInternalError("internal error in Trio - please file a bug!") from exc
     finally:
+        # Mark termination before closing anything, so every convergence
+        # path (normal exit, guest error, explicit host refusal, GC) agrees
+        # that the run is over and no late wakeup can touch closed handles.
+        runner.guest_terminated = True
         runner.close()
         GLOBAL_RUN_CONTEXT.__dict__.clear()
 
