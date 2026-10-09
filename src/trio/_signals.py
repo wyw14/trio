@@ -5,6 +5,8 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
+import attrs
+
 import trio
 
 from ._util import ConflictDetector, is_main_thread
@@ -12,8 +14,15 @@ from ._util import ConflictDetector, is_main_thread
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Generator, Iterable
     from types import FrameType
+    from typing import TypeAlias
 
     from typing_extensions import Self
+
+    # A handler may be an ordinary callable, or one of signal.signal()'s
+    # special sentinel values (SIG_IGN / SIG_DFL / None).
+    _Handler: TypeAlias = (
+        Callable[[int, FrameType | None], object] | int | signal.Handlers | None
+    )
 
 # Discussion of signal handling strategies:
 #
@@ -51,19 +60,125 @@ if TYPE_CHECKING:
 # can directly monitor for child process state changes.)
 
 
+# Per-signal bookkeeping for Trio's installed dispatcher.
+@attrs.define(eq=False)
+class _HandlerState:
+    # The handler that was installed for this signal immediately before Trio
+    # installed its own dispatcher. It is put back when the last Trio handler
+    # for this signal is removed.
+    original_handler: _Handler
+    # The currently-active Trio handlers for this signal, in registration
+    # order. Only the innermost (last) one receives each signal -- this
+    # preserves the traditional signal.signal() save/restore stacking used by
+    # nested 'with' blocks. Unlike a plain save/restore stack, though, removal
+    # works no matter what order registrations finish in: when a registration
+    # that is not on top goes away (e.g. its task gets cancelled while another
+    # receiver is still active), the other registrations keep working.
+    handlers: list[_Handler] = attrs.Factory(list)
+
+
+# Signals for which Trio's dispatcher is currently installed, mapped to the
+# state above. Signal handlers are process-global state and can only be
+# manipulated from the main thread, so this is a plain module-level dict --
+# but registrations are tracked independently and balanced, so the dict is
+# always empty whenever no Trio signal handler is active (in particular, it
+# does not leak across sequential calls to trio.run()).
+_signal_states: dict[int, _HandlerState] = {}
+
+
+def _run_special_handler(
+    handler: int | signal.Handlers | None,
+    signum: int,
+    state: _HandlerState,
+) -> None:
+    if handler == signal.SIG_IGN:
+        # SIG_IGN: the signal is simply discarded.
+        return
+    # SIG_DFL / None: hand the signal back to the operating system's default
+    # disposition. This usually terminates the process, but for signals whose
+    # default action is "ignore" it returns, in which case our dispatcher is
+    # reinstalled so the bookkeeping stays consistent.
+    signal.signal(signum, signal.SIG_DFL)
+    try:
+        signal.raise_signal(signum)
+    finally:
+        if _signal_states.get(signum) is state:
+            signal.signal(signum, _signal_dispatcher)
+
+
+def _signal_dispatcher(signum: int, frame: FrameType | None) -> None:
+    state = _signal_states.get(signum)
+    if state is None or not state.handlers:
+        # This can only happen in the tiny restoration window where the
+        # previous handler has already been reinstalled but this invocation of
+        # the dispatcher was already pending. Re-deliver the signal to whatever
+        # handler is installed now, instead of dropping it or invoking a
+        # callback that has already been torn down.
+        signal.raise_signal(signum)
+        return
+    # Only the innermost active registration receives the signal.
+    handler = state.handlers[-1]
+    if callable(handler):
+        handler(signum, frame)
+    else:
+        _run_special_handler(handler, signum, state)
+
+
+def _install_signal_handlers(signals: Iterable[int], handler: _Handler) -> None:
+    registered: list[int] = []
+    try:
+        for signum in set(signals):
+            state = _signal_states.get(signum)
+            if state is None:
+                # This may raise (e.g. for an invalid signal number); in that
+                # case nothing for this signum has been recorded yet.
+                original_handler = signal.signal(signum, _signal_dispatcher)
+                state = _HandlerState(original_handler=original_handler)
+                _signal_states[signum] = state
+            state.handlers.append(handler)
+            registered.append(signum)
+    except BaseException:
+        # Roll back everything this particular call installed, without
+        # touching registrations made by anyone else.
+        for signum in registered:
+            _remove_signal_handlers((signum,), handler)
+        raise
+
+
+def _remove_signal_handlers(signals: Iterable[int], handler: _Handler) -> None:
+    for signum in set(signals):
+        state = _signal_states.get(signum)
+        if state is None or handler not in state.handlers:
+            # Duplicate removal (or this handler was never registered for this
+            # signal) is a no-op. Never disturb a signal that someone else
+            # still has an active registration for.
+            continue
+        # Drop this registration's entry, wherever it happens to be in the
+        # stack. Searching from the end keeps nested registrations of the same
+        # callable balanced (the innermost one is torn down first).
+        for idx in range(len(state.handlers) - 1, -1, -1):
+            if state.handlers[idx] == handler:
+                del state.handlers[idx]
+                break
+        if not state.handlers:
+            # Restore the previous handler *before* forgetting the state, so a
+            # signal arriving in this restoration window is delivered to the
+            # restored handler -- never to our dispatcher with no live
+            # callbacks.
+            signal.signal(signum, state.original_handler)
+            del _signal_states[signum]
+
+
 @contextmanager
 def _signal_handler(
     signals: Iterable[int],
     handler: Callable[[int, FrameType | None], object] | int | signal.Handlers | None,
 ) -> Generator[None, None, None]:
-    original_handlers = {}
+    _install_signal_handlers(signals, handler)
     try:
-        for signum in set(signals):
-            original_handlers[signum] = signal.signal(signum, handler)
         yield
     finally:
-        for signum, original_handler in original_handlers.items():
-            signal.signal(signum, original_handler)
+        _remove_signal_handlers(signals, handler)
 
 
 class SignalReceiver:
@@ -85,7 +200,8 @@ class SignalReceiver:
 
     def _redeliver_remaining(self) -> None:
         # First make sure that any signals still in the delivery pipeline will
-        # get redelivered
+        # get redelivered. This is idempotent, so running cleanup more than
+        # once (e.g. an exception followed by a GeneratorExit) is harmless.
         self._closed = True
 
         # And then redeliver any that are sitting in pending. This is done
@@ -179,6 +295,13 @@ def open_signal_receiver(
         token.run_sync_soon(queue._add, signum, idempotent=True)
 
     try:
+        # The order here matters: exiting this block first removes our
+        # callback from the shared dispatcher (and, if we were the last
+        # listener, restores the previous OS-level handler). Only afterwards
+        # do we mark the queue closed and re-deliver pending signals. So any
+        # signal that arrives during teardown goes to a live handler -- either
+        # another listener, or the handler that was there before Trio -- and
+        # never to this receiver's now-invalid callback.
         with _signal_handler(signals, handler):
             yield queue
     finally:
